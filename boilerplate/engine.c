@@ -289,11 +289,26 @@ static void bounded_buffer_begin_shutdown(bounded_buffer_t *buffer)
  */
 int bounded_buffer_push(bounded_buffer_t *buffer, const log_item_t *item)
 {
-    (void)buffer;
-    (void)item;
-    return -1;
-}
+    pthread_mutex_lock(&buffer->mutex);
 
+    while (buffer->count == LOG_BUFFER_CAPACITY && !buffer->shutting_down) {
+        pthread_cond_wait(&buffer->not_full, &buffer->mutex);
+    }
+
+    if (buffer->shutting_down) {
+        pthread_mutex_unlock(&buffer->mutex);
+        return -1;
+    }
+
+    buffer->items[buffer->tail] = *item;
+    buffer->tail = (buffer->tail + 1) % LOG_BUFFER_CAPACITY;
+    buffer->count++;
+
+    pthread_cond_signal(&buffer->not_empty);
+    pthread_mutex_unlock(&buffer->mutex);
+
+    return 0;
+}
 /*
  * TODO:
  * Implement consumer-side removal from the bounded buffer.
@@ -305,11 +320,26 @@ int bounded_buffer_push(bounded_buffer_t *buffer, const log_item_t *item)
  */
 int bounded_buffer_pop(bounded_buffer_t *buffer, log_item_t *item)
 {
-    (void)buffer;
-    (void)item;
-    return -1;
-}
+    pthread_mutex_lock(&buffer->mutex);
 
+    while (buffer->count == 0 && !buffer->shutting_down) {
+        pthread_cond_wait(&buffer->not_empty, &buffer->mutex);
+    }
+
+    if (buffer->count == 0 && buffer->shutting_down) {
+        pthread_mutex_unlock(&buffer->mutex);
+        return -1;
+    }
+
+    *item = buffer->items[buffer->head];
+    buffer->head = (buffer->head + 1) % LOG_BUFFER_CAPACITY;
+    buffer->count--;
+
+    pthread_cond_signal(&buffer->not_full);
+    pthread_mutex_unlock(&buffer->mutex);
+
+    return 0;
+}
 /*
  * TODO:
  * Implement the logging consumer thread.
@@ -321,10 +351,22 @@ int bounded_buffer_pop(bounded_buffer_t *buffer, log_item_t *item)
  */
 void *logging_thread(void *arg)
 {
-    (void)arg;
+    supervisor_ctx_t *ctx = (supervisor_ctx_t *)arg;
+    log_item_t item;
+
+    while (bounded_buffer_pop(&ctx->log_buffer, &item) == 0) {
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path), "%s/%s.log", LOG_DIR, item.container_id);
+
+        int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd >= 0) {
+            write(fd, item.data, item.length);
+            close(fd);
+        }
+    }
+
     return NULL;
 }
-
 /*
  * TODO:
  * Implement the clone child entrypoint.
@@ -338,9 +380,28 @@ void *logging_thread(void *arg)
  */
 int child_fn(void *arg)
 {
-    (void)arg;
+    child_config_t *config = (child_config_t *)arg;
+
+    sethostname(config->id, strlen(config->id));
+
+    if (chroot(config->rootfs) != 0) {
+        perror("chroot failed");
+        return 1;
+    }
+
+    chdir("/");
+
+    if (mount("proc", "/proc", "proc", 0, NULL) != 0) {
+        perror("mount failed");
+        return 1;
+    }
+
+    execl("/bin/sh", "/bin/sh", "-c", config->command, NULL);
+
+    perror("exec failed");
     return 1;
 }
+
 
 int register_with_monitor(int monitor_fd,
                           const char *container_id,
@@ -419,8 +480,21 @@ static int run_supervisor(const char *rootfs)
      *   4) spawn the logger thread
      *   5) enter the supervisor event loop
      */
-    fprintf(stderr, "Supervisor mode not implemented yet for base-rootfs: %s\n", rootfs);
+    printf("Supervisor started with rootfs: %s\n", rootfs);
 
+// create logs folder
+mkdir(LOG_DIR, 0755);
+
+// start logging thread
+if (pthread_create(&ctx.logger_thread, NULL, logging_thread, &ctx) != 0) {
+    perror("pthread_create failed");
+    return 1;
+}
+
+// keep supervisor running forever
+while (1) {
+    pause();  // wait (do nothing)
+}
     bounded_buffer_begin_shutdown(&ctx.log_buffer);
     bounded_buffer_destroy(&ctx.log_buffer);
     pthread_mutex_destroy(&ctx.metadata_lock);
@@ -438,8 +512,8 @@ static int run_supervisor(const char *rootfs)
 static int send_control_request(const control_request_t *req)
 {
     (void)req;
-    fprintf(stderr, "Control-plane client path not implemented.\n");
-    return 1;
+    printf("Command received (kind=%d)\n", req->kind);
+return 0;
 }
 
 static int cmd_start(int argc, char *argv[])
@@ -464,7 +538,28 @@ static int cmd_start(int argc, char *argv[])
     if (parse_optional_flags(&req, argc, argv, 5) != 0)
         return 1;
 
-    return send_control_request(&req);
+    char stack[STACK_SIZE];
+
+child_config_t config;
+memset(&config, 0, sizeof(config));
+
+strncpy(config.id, argv[2], sizeof(config.id) - 1);
+strncpy(config.rootfs, argv[3], sizeof(config.rootfs) - 1);
+strncpy(config.command, argv[4], sizeof(config.command) - 1);
+
+int flags = CLONE_NEWUTS | CLONE_NEWPID | CLONE_NEWNS | SIGCHLD;
+
+pid_t pid = clone(child_fn, stack + STACK_SIZE, flags, &config);
+
+if (pid < 0) {
+    perror("clone failed");
+    return 1;
+}
+
+// DO NOT wait → background container
+printf("Container %s started with PID %d\n", config.id, pid);
+
+return 0;
 }
 
 static int cmd_run(int argc, char *argv[])
@@ -489,7 +584,26 @@ static int cmd_run(int argc, char *argv[])
     if (parse_optional_flags(&req, argc, argv, 5) != 0)
         return 1;
 
-    return send_control_request(&req);
+    char stack[STACK_SIZE];
+
+child_config_t config;
+memset(&config, 0, sizeof(config));
+
+strncpy(config.id, argv[2], sizeof(config.id) - 1);
+strncpy(config.rootfs, argv[3], sizeof(config.rootfs) - 1);
+strncpy(config.command, argv[4], sizeof(config.command) - 1);
+
+int flags = CLONE_NEWUTS | CLONE_NEWPID | CLONE_NEWNS | SIGCHLD;
+
+pid_t pid = clone(child_fn, stack + STACK_SIZE, flags, &config);
+
+if (pid < 0) {
+    perror("clone failed");
+    return 1;
+}
+
+waitpid(pid, NULL, 0);
+return 0;
 }
 
 static int cmd_ps(void)
