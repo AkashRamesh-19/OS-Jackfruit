@@ -1,5 +1,3 @@
-solved
-
 # Build artifacts (user-space)
 boilerplate/engine
 boilerplate/memory_hog
@@ -32,3 +30,8 @@ logs/
 *.swp
 *~
 .vscode/
+
+# Ensure all container roots are ignored even if renamed
+rootfs-*/
+# Ignore Alpine tarball
+alpine-minirootfs-*.tar.gz
