@@ -1,3 +1,5 @@
+solved
+
 # Build artifacts (user-space)
 boilerplate/engine
 boilerplate/memory_hog
@@ -33,5 +35,5 @@ logs/
 
 # Ensure all container roots are ignored even if renamed
 rootfs-*/
-# Ignore Alpine tarball
+# Ignore the Alpine tarball you just downloaded
 alpine-minirootfs-*.tar.gz

@@ -537,27 +537,11 @@ static int run_supervisor(const char *rootfs)
 
     // 4. Main Event Loop
     while (!ctx.should_stop) {
-
-        // --- ADDED: child exit handling ---
-        int status;
-        pid_t pid;
-        while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
-            container_record_t *cur = ctx.containers;
-            while (cur) {
-                if (cur->host_pid == pid) {
-                    cur->state = CONTAINER_EXITED;
-                    break;
-                }
-                cur = cur->next;
-            }
-        }
-
         int client_fd = accept(ctx.server_fd, NULL, NULL);
         if (client_fd < 0) continue;
 
         control_request_t req;
         if (recv(client_fd, &req, sizeof(req), 0) > 0) {
-
             if (req.kind == CMD_RUN || req.kind == CMD_START) {
 
                 // Prepare child config
@@ -567,11 +551,6 @@ static int run_supervisor(const char *rootfs)
                 strncpy(config->command, req.command, CHILD_COMMAND_LEN);
                 config->nice_value = req.nice_value;
 
-                // --- ADDED: Logging pipe ---
-                int pipefd[2];
-                pipe(pipefd);
-                config->log_write_fd = pipefd[1];
-
                 // Create the stack for clone
                 char *stack = malloc(STACK_SIZE);
 
@@ -580,88 +559,14 @@ static int run_supervisor(const char *rootfs)
 
                 pid_t child_pid = clone(child_fn, stack + STACK_SIZE, clone_flags, config);
 
-                if (child_pid > 0)
-                 {
+                if (child_pid > 0) {
                     // 5. Register the new PID with the Kernel Monitor!
                     register_with_monitor(ctx.monitor_fd, config->id, child_pid, 
                                         req.soft_limit_bytes, req.hard_limit_bytes);
 
                     printf("Container %s started with PID %d\n", config->id, child_pid);
-
-                    // --- ADDED: Track container ---
-                    container_record_t *rec = malloc(sizeof(*rec));
-                    strcpy(rec->id, config->id);
-                    rec->host_pid = child_pid;
-                    rec->state = CONTAINER_RUNNING;
-                    rec->next = ctx.containers;
-                    ctx.containers = rec;
-
-                    // --- ADDED: Read logs from pipe ---
-                    close(pipefd[1]);
-
-                    char buf[LOG_CHUNK_SIZE];
-                    int n;
-
-                    while ((n = read(pipefd[0], buf, sizeof(buf))) > 0) {
-                        log_item_t item;
-                        strncpy(item.container_id, config->id, CONTAINER_ID_LEN);
-                        memcpy(item.data, buf, n);
-                        item.length = n;
-
-                        bounded_buffer_push(&ctx.log_buffer, &item);
-                    }
-
-                    close(pipefd[0]);
                 }
             }
-
-            else if (req.kind == CMD_PS) {
-                container_record_t *cur = ctx.containers;
-
-                printf("ID\tPID\tSTATE\n");
-
-                while (cur) {
-                    printf("%s\t%d\t%s\n",
-                           cur->id,
-                           cur->host_pid,
-                           state_to_string(cur->state));
-                    cur = cur->next;
-                }
-            }
-
-            else if (req.kind == CMD_STOP) {
-                container_record_t *cur = ctx.containers;
-
-                while (cur) {
-                    if (strcmp(cur->id, req.container_id) == 0) {
-                        kill(cur->host_pid, SIGKILL);
-                        cur->state = CONTAINER_KILLED;
-
-                        unregister_from_monitor(ctx.monitor_fd,
-                                                cur->id,
-                                                cur->host_pid);
-                        break;
-                    }
-                    cur = cur->next;
-                }
-            }
-
-            else if (req.kind == CMD_LOGS) {
-                char path[PATH_MAX];
-                snprintf(path, sizeof(path), "%s/%s.log", LOG_DIR, req.container_id);
-
-                FILE *f = fopen(path, "r");
-                if (f) {
-                    char line[256];
-                    while (fgets(line, sizeof(line), f)) {
-                        printf("%s", line);
-                    }
-                    fclose(f);
-                } else {
-                    printf("No logs found\n");
-                }
-            }
-
             // Send back a success response
             control_response_t res = {0, "OK"};
             send(client_fd, &res, sizeof(res), 0);
@@ -671,6 +576,7 @@ static int run_supervisor(const char *rootfs)
 
     return 0;
 }
+
 /*
  * TODO:
  * Implement the client-side control request path.
@@ -702,7 +608,6 @@ static int send_control_request(const control_request_t *req)
     close(fd);
     return 0;
 }
-
 static int cmd_start(int argc, char *argv[])
 {
     control_request_t req;
@@ -718,11 +623,24 @@ static int cmd_start(int argc, char *argv[])
     req.kind = CMD_START;
     strncpy(req.container_id, argv[2], sizeof(req.container_id) - 1);
     strncpy(req.rootfs, argv[3], sizeof(req.rootfs) - 1);
-    strncpy(req.command, argv[4], sizeof(req.command) - 1);
+
+    // FIX: combine full command with arguments
+    req.command[0] = '\0';
+    int i;
+    for (i = 4; i < argc; i++) {
+        if (strncmp(argv[i], "--", 2) == 0)
+            break;
+
+        if (strlen(req.command) + strlen(argv[i]) + 2 < sizeof(req.command)) {
+            strcat(req.command, argv[i]);
+            strcat(req.command, " ");
+        }
+    }
+
     req.soft_limit_bytes = DEFAULT_SOFT_LIMIT;
     req.hard_limit_bytes = DEFAULT_HARD_LIMIT;
 
-    if (parse_optional_flags(&req, argc, argv, 5) != 0)
+    if (parse_optional_flags(&req, argc, argv, i) != 0)
         return 1;
 
     return send_control_request(&req);
@@ -743,11 +661,24 @@ static int cmd_run(int argc, char *argv[])
     req.kind = CMD_RUN;
     strncpy(req.container_id, argv[2], sizeof(req.container_id) - 1);
     strncpy(req.rootfs, argv[3], sizeof(req.rootfs) - 1);
-    strncpy(req.command, argv[4], sizeof(req.command) - 1);
+
+    // FIX: combine full command with arguments
+    req.command[0] = '\0';
+    int i;
+    for (i = 4; i < argc; i++) {
+        if (strncmp(argv[i], "--", 2) == 0)
+            break;
+
+        if (strlen(req.command) + strlen(argv[i]) + 2 < sizeof(req.command)) {
+            strcat(req.command, argv[i]);
+            strcat(req.command, " ");
+        }
+    }
+
     req.soft_limit_bytes = DEFAULT_SOFT_LIMIT;
     req.hard_limit_bytes = DEFAULT_HARD_LIMIT;
 
-    if (parse_optional_flags(&req, argc, argv, 5) != 0)
+    if (parse_optional_flags(&req, argc, argv, i) != 0)
         return 1;
 
     return send_control_request(&req);
@@ -839,3 +770,4 @@ int main(int argc, char *argv[])
     usage(argv[0]);
     return 1;
 }
+
